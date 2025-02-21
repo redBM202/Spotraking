@@ -203,6 +203,34 @@ class SpotifyController extends Controller
         }
     }
 
+    private function getLastPlayedTrack() {
+        try {
+            $token = $this->checkAndGetToken();
+            
+            $ch = curl_init();
+            curl_setopt_array($ch, [
+                CURLOPT_URL => "https://api.spotify.com/v1/me/player/recently-played?limit=1",
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_HTTPHEADER => [
+                    'Authorization: Bearer ' . $token,
+                    'Accept: application/json'
+                ]
+            ]);
+            
+            $result = curl_exec($ch);
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+
+            if ($httpCode === 200) {
+                $data = json_decode($result);
+                return !empty($data->items[0]) ? $data->items[0] : null;
+            }
+            return null;
+        } catch (\Exception $e) {
+            return null;
+        }
+    }
+
     public function search(Request $request)
     {
         try {
@@ -230,33 +258,23 @@ class SpotifyController extends Controller
                 $playbackState = $this->getPlayerState();  // Updated method name
                 if ($playbackState && isset($playbackState->item)) {
                     $currentTrack = $playbackState;
+                } else {
+                    // If no active playback, get last played track
+                    $lastPlayed = $this->getLastPlayedTrack();
+                    if ($lastPlayed) {
+                        $currentTrack = (object)[
+                            'item' => $lastPlayed->track,
+                            'is_playing' => false
+                        ];
+                        $playbackState = (object)[
+                            'is_playing' => false
+                        ];
+                    }
                 }
             } catch (\Exception $e) {
                 // Silently handle playback errors
                 $currentTrack = null;
             }
-
-            // Get recent tracks
-            $recentTracks = cache()->remember('spotify_recent_tracks', 30, function () {
-                $tracks = $this->api->getMyRecentTracks([
-                    'limit' => 10,
-                    'market' => 'US'
-                ]);
-
-                if (!empty($tracks->items)) {
-                    $trackIds = array_map(function ($item) {
-                        return $item->track->id;
-                    }, $tracks->items);
-
-                    $tracksInfo = $this->api->getTracks($trackIds);
-                    
-                    foreach ($tracks->items as $index => $item) {
-                        $item->track->popularity = $tracksInfo->tracks[$index]->popularity ?? 0;
-                    }
-                }
-
-                return $tracks->items;
-            });
 
             $tracks = [];
             if ($query) {
@@ -288,8 +306,7 @@ class SpotifyController extends Controller
                 'query' => $query,
                 'profile' => $profile,
                 'currentTrack' => $currentTrack,
-                'playbackState' => $playbackState,
-                'recentTracks' => $recentTracks
+                'playbackState' => $playbackState
             ]);
 
         } catch (\Exception $e) {
@@ -495,6 +512,9 @@ class SpotifyController extends Controller
             $options = [];
             if ($request->has('uri')) {
                 $options['uris'] = [$request->uri];
+            } else if ($request->has('track_id')) {
+                // Support playing specific track by ID
+                $options['uris'] = ['spotify:track:' . $request->track_id];
             }
 
             curl_setopt_array($ch, [

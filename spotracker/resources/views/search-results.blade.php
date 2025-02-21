@@ -266,7 +266,7 @@
 
                 @if(isset($currentTrack) && isset($currentTrack->item))
                     <div class="now-playing">
-                        <h3>Currently Playing:</h3>
+                        <h3>{{ isset($playbackState->is_playing) && $playbackState->is_playing ? 'Currently Playing:' : 'Last Played:' }}</h3>
                         <iframe class="embedded-player"
                             src="https://open.spotify.com/embed/track/{{ $currentTrack->item->id }}?utm_source=generator&hideControls=1&showPlayButton=0"
                             frameborder="0"
@@ -275,8 +275,8 @@
                         </iframe>
                         <div class="player-controls">
                             <button onclick="controlPlayback('previous')" class="control-button" id="prevButton">⏮ Previous</button>
-                            <button onclick="togglePlayback()" class="control-button" id="playPauseButton">
-                                {{ isset($playbackState->is_playing) && $playbackState->is_playing ? '⏸ Pause' : '▶ Play' }}
+                            <button onclick="togglePlayback('{{ $currentTrack->item->id }}')" class="control-button" id="playPauseButton">
+                                {{ isset($playbackState->is_playing) && $playbackState->is_playing ? '⏸ Pause' : '▶ Resume' }}
                             </button>
                             <button onclick="controlPlayback('next')" class="control-button" id="nextButton">Next ⏭</button>
                         </div>
@@ -335,46 +335,6 @@
                             <a href="{{ $track->external_urls->spotify }}" target="_blank" class="play-button">
                                 Open in Spotify
                             </a>
-                        </div>
-                    </div>
-                @endforeach
-            </div>
-        @endif
-
-        @if(isset($recentTracks))
-            <div class="recent-tracks">
-                <h2>Recently Played</h2>
-                @foreach($recentTracks as $recent)
-                    <div class="recent-track">
-                        <img src="{{ $recent->track->album->images[0]->url }}" alt="Album art">
-                        <div>
-                            <strong>{{ $recent->track->name }}</strong>
-                            <p>{{ collect($recent->track->artists)->pluck('name')->implode(', ') }}</p>
-                            <span class="timestamp">
-                                Played at: {{ \Carbon\Carbon::parse($recent->played_at)->diffForHumans() }}
-                            </span>
-                            <p class="play-count">
-                                Played {{ $recent->track->popularity ?? 0 }} times
-                            </p>
-                            <div class="popularity-text">
-                                <span>Played on Spotify:</span>
-                                <span class="popularity-star">
-                                    @if($recent->track->popularity > 90)
-                                        100M+ plays 🔥
-                                    @elseif($recent->track->popularity > 75)
-                                        50M+ plays ⭐
-                                    @elseif($recent->track->popularity > 50)
-                                        10M+ plays 👌
-                                    @elseif($recent->track->popularity > 25)
-                                        1M+ plays 📈
-                                    @else
-                                        <100K plays 💎
-                                    @endif
-                                </span>
-                            </div>
-                            <div class="popularity-meter">
-                                <div class="popularity-fill" style="width: {{ $recent->track->popularity ?? 0 }}%"></div>
-                            </div>
                         </div>
                     </div>
                 @endforeach
@@ -551,7 +511,7 @@
             });
         }
 
-        function togglePlayback() {
+        function togglePlayback(trackId = null) {
             const deviceId = document.getElementById('deviceSelector').value;
             if (!deviceId) {
                 alert('Please select a playback device first');
@@ -563,13 +523,18 @@
             const isPlaying = button.textContent.includes('Pause');
             const action = isPlaying ? 'pause' : 'play';
 
+            const data = { device_id: deviceId };
+            if (!isPlaying && trackId) {
+                data.track_id = trackId;
+            }
+
             fetch(`/spotify/${action}`, {
                 method: 'POST',
                 headers: {
                     'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content,
                     'Content-Type': 'application/json'
                 },
-                body: JSON.stringify({ device_id: deviceId })
+                body: JSON.stringify(data)
             })
             .then(response => response.json())
             .then(data => {
