@@ -231,90 +231,138 @@ class SpotifyController extends Controller
         }
     }
 
+    private function initCurl($url, $token, $customOptions = []) {
+        $ch = curl_init();
+        $defaultOptions = [
+            CURLOPT_URL => $url,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_SSL_VERIFYPEER => false,
+            CURLOPT_HTTPHEADER => [
+                'Authorization: Bearer ' . $token,
+                'Accept: application/json',
+                'Content-Type: application/json'
+            ],
+            CURLOPT_TIMEOUT => 5,
+            CURLOPT_CONNECTTIMEOUT => 3,
+            CURLOPT_FOLLOWLOCATION => true
+        ];
+        
+        $options = $customOptions + $defaultOptions;
+        curl_setopt_array($ch, $options);
+        return $ch;
+    }
+
+    private function handleApiResponse($ch) {
+        $result = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $error = curl_error($ch);
+        curl_close($ch);
+
+        return [$result, $httpCode, $error];
+    }
+
     public function search(Request $request)
     {
         try {
-            $this->checkAndGetToken();
-            
-            // Test API connection first
-            try {
-                $this->api->me();
-            } catch (\Exception $e) {
-                return redirect()->route('spotify.login')
-                    ->with('error', 'Your session has expired. Please log in again.');
-            }
-
+            $token = $this->checkAndGetToken();
             $query = $request->input('q');
             
-            // Get profile data
-            $profile = cache()->remember('spotify_profile', 300, function () {
-                return $this->api->me();
-            });
+            // Get all data in parallel using curl_multi
+            $mh = curl_multi_init();
+            $channels = [];
 
-            // Get current track with error handling
-            $currentTrack = null;
-            $playbackState = null;
-            try {
-                $playbackState = $this->getPlayerState();  // Updated method name
-                if ($playbackState && isset($playbackState->item)) {
-                    $currentTrack = $playbackState;
-                } else {
-                    // If no active playback, get last played track
-                    $lastPlayed = $this->getLastPlayedTrack();
-                    if ($lastPlayed) {
-                        $currentTrack = (object)[
-                            'item' => $lastPlayed->track,
-                            'is_playing' => false
-                        ];
-                        $playbackState = (object)[
-                            'is_playing' => false
-                        ];
-                    }
-                }
-            } catch (\Exception $e) {
-                // Silently handle playback errors
-                $currentTrack = null;
+            // Profile request
+            $channels['profile'] = $this->initCurl(
+                "https://api.spotify.com/v1/me",
+                $token
+            );
+            
+            // Current playback request
+            $channels['playback'] = $this->initCurl(
+                "https://api.spotify.com/v1/me/player/currently-playing",
+                $token
+            );
+            
+            // Last played track request
+            $channels['lastPlayed'] = $this->initCurl(
+                "https://api.spotify.com/v1/me/player/recently-played?limit=1",
+                $token
+            );
+            
+            // Devices request
+            $channels['devices'] = $this->initCurl(
+                "https://api.spotify.com/v1/me/player/devices",
+                $token
+            );
+
+            // Add all handles and execute requests
+            foreach ($channels as $ch) {
+                curl_multi_add_handle($mh, $ch);
             }
 
-            $tracks = [];
+            // Add search request if query exists
             if ($query) {
-                $cacheKey = 'spotify_search_' . md5($query);
-                $tracks = cache()->remember($cacheKey, 60, function () use ($query) {
-                    $results = $this->api->search($query, 'track,artist', [
-                        'limit' => 20,
-                        'market' => 'US'
-                    ]);
+                $channels['search'] = $this->initCurl(
+                    "https://api.spotify.com/v1/search?q=" . urlencode($query) . "&type=track&limit=20&market=US",
+                    $token
+                );
+                curl_multi_add_handle($mh, $channels['search']);
+            }
 
-                    if (!empty($results->tracks->items)) {
-                        $trackIds = array_map(function ($track) {
-                            return $track->id;
-                        }, $results->tracks->items);
+            // Execute all requests
+            do {
+                $status = curl_multi_exec($mh, $running);
+                if ($running) {
+                    curl_multi_select($mh);
+                }
+            } while ($running && $status == CURLM_OK);
 
-                        $tracksInfo = $this->api->getTracks($trackIds);
-                        
-                        foreach ($results->tracks->items as $index => $track) {
-                            $track->popularity = $tracksInfo->tracks[$index]->popularity ?? 0;
-                        }
-                    }
+            // Process all responses
+            $responses = [];
+            foreach ($channels as $key => $ch) {
+                $responses[$key] = curl_multi_getcontent($ch);
+                curl_multi_remove_handle($mh, $ch);
+            }
+            curl_multi_close($mh);
 
-                    return $results->tracks->items;
-                });
+            // Process responses
+            $profile = json_decode($responses['profile']);
+            $playbackState = json_decode($responses['playback']);
+            $devices = json_decode($responses['devices']);
+            $lastPlayed = json_decode($responses['lastPlayed']);
+            $tracks = [];
+
+            // Handle current playback state
+            $currentTrack = null;
+            if ($playbackState && isset($playbackState->item)) {
+                $currentTrack = (object)[
+                    'item' => $playbackState->item,
+                    'is_playing' => $playbackState->is_playing ?? false
+                ];
+            } elseif ($lastPlayed && isset($lastPlayed->items[0])) {
+                // Use last played if no current playback
+                $currentTrack = (object)[
+                    'item' => $lastPlayed->items[0]->track,
+                    'is_playing' => false
+                ];
+            }
+
+            if ($query && isset($responses['search'])) {
+                $searchResults = json_decode($responses['search']);
+                $tracks = $searchResults->tracks->items ?? [];
             }
 
             return view('search-results', [
-                'tracks' => $tracks,
-                'query' => $query,
                 'profile' => $profile,
                 'currentTrack' => $currentTrack,
-                'playbackState' => $playbackState
+                'playbackState' => $currentTrack, // Use currentTrack as playbackState
+                'tracks' => $tracks,
+                'query' => $query,
+                'devices' => $devices
             ]);
 
         } catch (\Exception $e) {
-            if (str_contains($e->getMessage(), 'Please log in again')) {
-                return redirect()->route('spotify.login')
-                    ->with('error', $e->getMessage());
-            }
-            return response()->view('error', ['message' => 'Search failed: ' . $e->getMessage()]);
+            return response()->view('error', ['message' => $e->getMessage()], 500);
         }
     }
 
@@ -396,7 +444,8 @@ class SpotifyController extends Controller
                     'Authorization: Bearer ' . $token,
                     'Accept: application/json'
                 ],
-                CURLOPT_TIMEOUT => 5
+                CURLOPT_TIMEOUT => 5,
+                CURLOPT_SSL_VERIFYPEER => false
             ]);
             
             $result = curl_exec($ch);
@@ -433,7 +482,8 @@ class SpotifyController extends Controller
                 CURLOPT_HTTPHEADER => [
                     'Authorization: Bearer ' . $token,
                     'Accept: application/json'
-                ]
+                ],
+                CURLOPT_SSL_VERIFYPEER => false
             ]);
             
             $result = curl_exec($ch);
@@ -486,7 +536,7 @@ class SpotifyController extends Controller
 
             if ($needsDeviceActivation) {
                 $ch = curl_init();
-                curl_setopt_array($ch, [
+                $options = [
                     CURLOPT_URL => "https://api.spotify.com/v1/me/player",
                     CURLOPT_RETURNTRANSFER => true,
                     CURLOPT_CUSTOMREQUEST => "PUT",
@@ -497,36 +547,38 @@ class SpotifyController extends Controller
                     CURLOPT_HTTPHEADER => [
                         'Authorization: Bearer ' . $token,
                         'Content-Type: application/json'
-                    ]
-                ]);
+                    ],
+                    CURLOPT_SSL_VERIFYPEER => false
+                ];
                 
+                curl_setopt_array($ch, $options);
                 curl_exec($ch);
                 curl_close($ch);
-                usleep(500000); // 500ms wait
+                usleep(500000);
             }
 
             // Then handle playback
             $ch = curl_init();
             $url = "https://api.spotify.com/v1/me/player/play?device_id=" . $deviceId;
             
-            $options = [];
-            if ($request->has('uri')) {
-                $options['uris'] = [$request->uri];
-            } else if ($request->has('track_id')) {
-                // Support playing specific track by ID
-                $options['uris'] = ['spotify:track:' . $request->track_id];
-            }
-
-            curl_setopt_array($ch, [
+            $options = [
                 CURLOPT_URL => $url,
                 CURLOPT_RETURNTRANSFER => true,
                 CURLOPT_CUSTOMREQUEST => "PUT",
-                CURLOPT_POSTFIELDS => !empty($options) ? json_encode($options) : "",
+                CURLOPT_SSL_VERIFYPEER => false,
                 CURLOPT_HTTPHEADER => [
                     'Authorization: Bearer ' . $token,
                     'Content-Type: application/json'
                 ]
-            ]);
+            ];
+
+            if ($request->has('uri')) {
+                $options[CURLOPT_POSTFIELDS] = json_encode(['uris' => [$request->uri]]);
+            } else if ($request->has('track_id')) {
+                $options[CURLOPT_POSTFIELDS] = json_encode(['uris' => ['spotify:track:' . $request->track_id]]);
+            }
+
+            curl_setopt_array($ch, $options);
             
             $result = curl_exec($ch);
             $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
@@ -576,7 +628,8 @@ class SpotifyController extends Controller
                     'Authorization: Bearer ' . $token,
                     'Content-Type: application/json'
                 ],
-                CURLOPT_TIMEOUT => 5
+                CURLOPT_TIMEOUT => 5,
+                CURLOPT_SSL_VERIFYPEER => false
             ]);
             
             $result = curl_exec($ch);
@@ -624,15 +677,23 @@ class SpotifyController extends Controller
     {
         try {
             $token = $this->checkAndGetToken();
+            $deviceId = $request->device_id;
             
+            if (!$deviceId) {
+                throw new \Exception('Device ID is required');
+            }
+
             $ch = curl_init();
             curl_setopt_array($ch, [
                 CURLOPT_URL => "https://api.spotify.com/v1/me/player/next",
                 CURLOPT_RETURNTRANSFER => true,
                 CURLOPT_POST => true,
                 CURLOPT_HTTPHEADER => [
-                    'Authorization: Bearer ' . $token
-                ]
+                    'Authorization: Bearer ' . $token,
+                    'Content-Type: application/json'
+                ],
+                CURLOPT_SSL_VERIFYPEER => false,
+                CURLOPT_POSTFIELDS => json_encode(['device_id' => $deviceId])
             ]);
             
             $result = curl_exec($ch);
@@ -643,9 +704,17 @@ class SpotifyController extends Controller
                 throw new \Exception('Failed to skip track');
             }
 
-            return response()->json(['status' => 'success']);
+            // Get updated playback state
+            $currentState = $this->getCurrentPlaybackState();
+            return response()->json([
+                'status' => 'success',
+                'is_playing' => $currentState['is_playing'] ?? false
+            ]);
         } catch (\Exception $e) {
-            return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);
+            return response()->json([
+                'status' => 'error', 
+                'message' => $e->getMessage()
+            ], 500);
         }
     }
 
@@ -653,15 +722,23 @@ class SpotifyController extends Controller
     {
         try {
             $token = $this->checkAndGetToken();
+            $deviceId = $request->device_id;
             
+            if (!$deviceId) {
+                throw new \Exception('Device ID is required');
+            }
+
             $ch = curl_init();
             curl_setopt_array($ch, [
                 CURLOPT_URL => "https://api.spotify.com/v1/me/player/previous",
                 CURLOPT_RETURNTRANSFER => true,
                 CURLOPT_POST => true,
                 CURLOPT_HTTPHEADER => [
-                    'Authorization: Bearer ' . $token
-                ]
+                    'Authorization: Bearer ' . $token,
+                    'Content-Type: application/json'
+                ],
+                CURLOPT_SSL_VERIFYPEER => false,
+                CURLOPT_POSTFIELDS => json_encode(['device_id' => $deviceId])
             ]);
             
             $result = curl_exec($ch);
@@ -672,9 +749,17 @@ class SpotifyController extends Controller
                 throw new \Exception('Failed to go to previous track');
             }
 
-            return response()->json(['status' => 'success']);
+            // Get updated playback state
+            $currentState = $this->getCurrentPlaybackState();
+            return response()->json([
+                'status' => 'success',
+                'is_playing' => $currentState['is_playing'] ?? false
+            ]);
         } catch (\Exception $e) {
-            return response()->json(['status' => 'error', 'message' => $e->getMessage()], 500);
+            return response()->json([
+                'status' => 'error', 
+                'message' => $e->getMessage()
+            ], 500);
         }
     }
 }
